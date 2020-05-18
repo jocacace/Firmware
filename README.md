@@ -16,7 +16,7 @@ Compile and launch it!
         $ cd Firmware && make px4_sitl_default 
 				$ make px4_sitl_defaul gazebo 
 
-    During the installation you should install some additional dependencies (follow the instruction in the compilation shell):
+During the installation you should install some additional dependencies (follow the instruction in the compilation shell):
     
 				$ sudo apt install python3-pip
 				$ pip3 install --user empy
@@ -27,12 +27,12 @@ Compile and launch it!
 				$ pip3 install --user jinja2
 
 
-    To allow ROS/FCU communication you should install Mavros package:
+To allow ROS/FCU communication you should install Mavros package:
 
 				$ sudo apt-get install ros-melodic-mavros ros-melodic-mavros-msgs 
 
     
-    Now you can install the geographic dataset
+Now you can install the geographic dataset
 
 				$ sudo /opt/ros/melodic/lib/mavros/install_geographiclib_datasets.sh
         
