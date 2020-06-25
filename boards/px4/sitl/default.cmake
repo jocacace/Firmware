@@ -50,6 +50,7 @@ px4_add_board(
 		vmount
 		vtol_att_control
 		uuv_att_control
+    lee_controller
 
 	SYSTEMCMDS
 		#config
