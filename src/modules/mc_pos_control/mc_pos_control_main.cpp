@@ -577,6 +577,8 @@ MulticopterPositionControl::Run()
 
 		// check if any task is active
 		if (_flight_tasks.isAnyTaskActive()) {
+
+
 			// setpoints and constraints for the position controller from flighttask or failsafe
 			vehicle_local_position_setpoint_s setpoint = FlightTask::empty_setpoint;
 			vehicle_constraints_s constraints = FlightTask::empty_constraints;
@@ -1063,6 +1065,8 @@ int MulticopterPositionControl::task_spawn(int argc, char *argv[])
 		_task_id = task_id_is_work_queue;
 
 		if (instance->init()) {
+						printf("INit ok??? Task id: %d\n", _task_id);
+
 			return PX4_OK;
 		}
 

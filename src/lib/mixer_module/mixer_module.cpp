@@ -361,14 +361,22 @@ bool MixingOutput::update()
 		}
 	}
 
+	//printf("Controls: ");
+	//printf("%f %f %f %f\n", (double)_controls[0].control[0], (double)_controls[0].control[1], (double)_controls[0].control[2], (double)_controls[0].control[3] );
+
+
 	/* do mixing */
 	float outputs[MAX_ACTUATORS] {};
 	const unsigned mixed_num_outputs = _mixers->mix(outputs, _max_num_outputs);
 
+
+	//printf("outputs: %f %f %f %f\n", (double)outputs[0], (double)outputs[1], (double)outputs[2], (double)outputs[3]);
 	/* the output limit call takes care of out of band errors, NaN and constrains */
 	output_limit_calc(_throttle_armed, armNoThrottle(), mixed_num_outputs, _reverse_output_mask,
 			  _disarmed_value, _min_value, _max_value, outputs, _current_output_value, &_output_limit);
 
+
+	//printf("_current_output_value: %f %f %f %f\n", (double)_current_output_value[0], (double)_current_output_value[1], (double)_current_output_value[2], (double)_current_output_value[3]);
 	/* overwrite outputs in case of force_failsafe with _failsafe_value values */
 	if (_armed.force_failsafe) {
 		for (size_t i = 0; i < mixed_num_outputs; i++) {
@@ -409,9 +417,13 @@ MixingOutput::setAndPublishActuatorOutputs(unsigned num_outputs, actuator_output
 {
 	actuator_outputs.noutputs = num_outputs;
 
+
+	//printf("actuator_outputs in mixer\n");
 	for (size_t i = 0; i < num_outputs; ++i) {
 		actuator_outputs.output[i] = _current_output_value[i];
+	//	printf("%f - ", (double)actuator_outputs.output[i]);	
 	}
+	//printf("\n");
 
 	actuator_outputs.timestamp = hrt_absolute_time();
 	_outputs_pub.publish(actuator_outputs);

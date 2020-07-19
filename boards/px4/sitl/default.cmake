@@ -51,6 +51,7 @@ px4_add_board(
 		vtol_att_control
 		uuv_att_control
     lee_controller
+		pwm_out_test
 
 	SYSTEMCMDS
 		#config

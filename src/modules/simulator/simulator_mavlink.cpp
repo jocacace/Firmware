@@ -177,6 +177,7 @@ mavlink_hil_actuator_controls_t Simulator::actuator_controls_from_outputs()
 
 void Simulator::send_controls()
 {
+
 	orb_copy(ORB_ID(actuator_outputs), _actuator_outputs_sub, &_actuator_outputs);
 
 	if (_actuator_outputs.timestamp > 0) {
@@ -186,6 +187,13 @@ void Simulator::send_controls()
 		mavlink_msg_hil_actuator_controls_encode(_param_mav_sys_id.get(), _param_mav_comp_id.get(), &message, &hil_act_control);
 
 		PX4_DEBUG("sending controls t=%ld (%ld)", _actuator_outputs.timestamp, hil_act_control.time_usec);
+
+		//printf("_vehicle_status.arming_state: %d\n", _vehicle_status.arming_state);
+		//printf("actuator output: "); //COSA SONO????
+		//for(int i=0; i<16; i++ ) {
+		//	printf("%f - ", _actuator_outputs.output[i] );
+		//}
+		//printf("\n");
 
 		send_mavlink_message(message);
 	}
@@ -571,6 +579,7 @@ void *Simulator::sending_trampoline(void * /*unused*/)
 
 void Simulator::send()
 {
+
 #ifdef __PX4_DARWIN
 	pthread_setname_np("sim_send");
 #else

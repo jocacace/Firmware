@@ -31,10 +31,10 @@
 #
 ############################################################################
 px4_add_module(
-	MODULE modules__lee_controller
-	MAIN lee_controller
+	MODULE modules__pwm_out_test
+	MAIN pwm_out_test
 	SRCS
-		lee_controller.cpp
+		pwm_out_test.cpp
 	DEPENDS		
 		mathlib		
 		px4_work_queue
@@ -44,5 +44,4 @@ px4_add_module(
 		ecl_geo
 		WeatherVane
 		CollisionPrevention
-		
 	)

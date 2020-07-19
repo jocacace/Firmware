@@ -57,6 +57,8 @@ mc_rate_control start
 # Start Multicopter Attitude Controller.
 #
 mc_att_control start
+#pwm_out_test start
+lee_controller start
 
 #
 # Start Multicopter Position Controller.

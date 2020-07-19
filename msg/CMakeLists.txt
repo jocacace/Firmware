@@ -169,6 +169,7 @@ set(msg_files
 	wheel_encoders.msg
 	wind_estimate.msg
 	yaw_estimator_status.msg
+	vehicle_pwm_output.msg
 )
 
 set(deprecated_msgs

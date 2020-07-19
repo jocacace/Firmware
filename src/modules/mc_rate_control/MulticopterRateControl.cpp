@@ -246,7 +246,7 @@ MulticopterRateControl::Run()
 
 		// run the rate controller
 		if (_v_control_mode.flag_control_rates_enabled && !_actuators_0_circuit_breaker_enabled) {
-
+			//printf("armed: %d\n", _v_control_mode.flag_armed);
 			// reset integral if disarmed
 			if (!_v_control_mode.flag_armed || _vehicle_status.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
 				_rate_control.resetIntegral();
@@ -301,6 +301,14 @@ MulticopterRateControl::Run()
 
 			actuators.timestamp = hrt_absolute_time();
 			_actuators_0_pub.publish(actuators);
+
+
+			//printf("Want to publish a control data: %f %f %f %f\n", (double)actuators.control[actuator_controls_s::INDEX_ROLL], 
+			//														(double)actuators.control[actuator_controls_s::INDEX_YAW], 
+			//														(double)actuators.control[actuator_controls_s::INDEX_THROTTLE], 
+			//														(double)actuators.control[actuator_controls_s::INDEX_ROLL]);
+
+
 
 		} else if (_v_control_mode.flag_control_termination_enabled) {
 			if (!_vehicle_status.is_vtol) {

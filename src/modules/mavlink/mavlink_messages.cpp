@@ -1536,6 +1536,8 @@ protected:
 			actuator_armed_s armed{};
 			_armed_sub.copy(&armed);
 
+
+
 			airspeed_validated_s airspeed_validated{};
 			_airspeed_validated_sub.copy(&airspeed_validated);
 
@@ -1558,6 +1560,7 @@ protected:
 				msg.throttle = 100 * math::max(
 						       act0.control[actuator_controls_s::INDEX_THROTTLE],
 						       act1.control[actuator_controls_s::INDEX_THROTTLE]);
+
 
 			} else {
 				msg.throttle = 0.0f;
@@ -3251,6 +3254,7 @@ protected:
 		actuator_controls_s act_ctrl;
 
 		if (_act_ctrl_sub && _act_ctrl_sub->update(&act_ctrl)) {
+
 			mavlink_actuator_control_target_t msg{};
 
 			msg.time_usec = act_ctrl.timestamp;
@@ -3260,7 +3264,7 @@ protected:
 				msg.controls[i] = act_ctrl.control[i];
 			}
 
-			mavlink_msg_actuator_control_target_send_struct(_mavlink->get_channel(), &msg);
+			//mavlink_msg_actuator_control_target_send_struct(_mavlink->get_channel(), &msg);
 
 			return true;
 		}
