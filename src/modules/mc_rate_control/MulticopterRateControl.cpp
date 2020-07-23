@@ -300,6 +300,11 @@ MulticopterRateControl::Run()
 			}
 
 			actuators.timestamp = hrt_absolute_time();
+			actuators.control[actuator_controls_s::INDEX_ROLL] 	 	= 1.5;
+			actuators.control[actuator_controls_s::INDEX_PITCH]	 	= 1.5;
+			actuators.control[actuator_controls_s::INDEX_YAW]	 	= 1.5;
+			actuators.control[actuator_controls_s::INDEX_THROTTLE]  = 1.5;
+
 			_actuators_0_pub.publish(actuators);
 
 
