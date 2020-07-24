@@ -1,7 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2020 Jonathan Cacace <jonathan.cacace@gmail.com>
- *   All rights reserved.
+ *   Copyright (c) 2013-2019 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -34,505 +33,297 @@
 
 #include "lee_controller.hpp"
 
+#include <drivers/drv_hrt.h>
+#include <circuit_breaker/circuit_breaker.h>
+#include <mathlib/math/Limits.hpp>
+#include <mathlib/math/Functions.hpp>
 
-LeeControl::LeeControl() :
-	SuperBlock(nullptr, "LeeCtrl"),
+using namespace matrix;
+using namespace time_literals;
+using math::radians;
+
+LeeController::LeeController(bool vtol) :
 	ModuleParams(nullptr),
-	WorkItem(MODULE_NAME, px4::wq_configurations::lee_ctrl),
-	_actuators_0_pub(ORB_ID(actuator_controls_0)),
-	_cycle_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle time"))  {
+	WorkItem(MODULE_NAME, px4::wq_configurations::rate_ctrl),
+	_actuators_0_pub(vtol ? ORB_ID(actuator_controls_virtual_mc) : ORB_ID(actuator_controls_0)),
+	_loop_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle"))
+{
+	_vehicle_status.vehicle_type = vehicle_status_s::VEHICLE_TYPE_ROTARY_WING;
 
-	// fetch initial parameter values
-	parameters_update(true);
-
-	// set failsafe hysteresis
-	//_failsafe_land_hysteresis.set_hysteresis_time_from(false, LOITER_TIME_BEFORE_DESCEND);
+	parameters_updated();
 }
 
-LeeControl::~LeeControl() {
-	perf_free(_cycle_perf);
+LeeController::~LeeController()
+{
+	perf_free(_loop_perf);
 }
 
 bool
-LeeControl::init()
+LeeController::init()
 {
-	if (!_local_pos_sub.registerCallback()) {
-		PX4_ERR("vehicle_local_position callback registration failed!");
+	if (!_vehicle_angular_velocity_sub.registerCallback()) {
+		PX4_ERR("vehicle_angular_velocity callback registration failed!");
 		return false;
 	}
-
-	// limit to every other vehicle_local_position update (~62.5 Hz)
-	_local_pos_sub.set_interval_us(16_ms);
-
-	_time_stamp_last_loop = hrt_absolute_time();
 
 	return true;
 }
 
 void
-LeeControl::warn_rate_limited(const char *string)
+LeeController::parameters_updated()
 {
-	hrt_abstime now = hrt_absolute_time();
-
-	if (now - _last_warn > 200_ms) {
-		PX4_WARN("%s", string);
-		_last_warn = now;
-	}
+	_actuators_0_circuit_breaker_enabled = circuit_breaker_enabled_by_val(_param_cbrk_rate_ctrl.get(), CBRK_RATE_CTRL_KEY);
 }
 
-int
-LeeControl::parameters_update(bool force)
+float
+LeeController::get_landing_gear_state()
 {
-	/*
-	// check for parameter updates
-	if (_parameter_update_sub.updated() || force) {
-		// clear update
-		parameter_update_s pupdate;
-		_parameter_update_sub.copy(&pupdate);
-
-		// update parameters from storage
-		ModuleParams::updateParams();
-		SuperBlock::updateParams();
-
-		
-		if (_param_mpc_tiltmax_air.get() > MAX_SAFE_TILT_DEG) {
-			_param_mpc_tiltmax_air.set(MAX_SAFE_TILT_DEG);
-			_param_mpc_tiltmax_air.commit();
-			mavlink_log_critical(&_mavlink_log_pub, "Tilt constrained to safe value");
-		}
-
-		if (_param_mpc_tiltmax_lnd.get() > _param_mpc_tiltmax_air.get()) {
-			_param_mpc_tiltmax_lnd.set(_param_mpc_tiltmax_air.get());
-			_param_mpc_tiltmax_lnd.commit();
-			mavlink_log_critical(&_mavlink_log_pub, "Land tilt has been constrained by max tilt");
-		}
-
-		_control.setPositionGains(Vector3f(_param_mpc_xy_p.get(), _param_mpc_xy_p.get(), _param_mpc_z_p.get()));
-		_control.setVelocityGains(Vector3f(_param_mpc_xy_vel_p.get(), _param_mpc_xy_vel_p.get(), _param_mpc_z_vel_p.get()),
-					  Vector3f(_param_mpc_xy_vel_i.get(), _param_mpc_xy_vel_i.get(), _param_mpc_z_vel_i.get()),
-					  Vector3f(_param_mpc_xy_vel_d.get(), _param_mpc_xy_vel_d.get(), _param_mpc_z_vel_d.get()));
-		_control.setVelocityLimits(_param_mpc_xy_vel_max.get(), _param_mpc_z_vel_max_up.get(), _param_mpc_z_vel_max_dn.get());
-		_control.setThrustLimits(_param_mpc_thr_min.get(), _param_mpc_thr_max.get());
-		_control.setTiltLimit(M_DEG_TO_RAD_F * _param_mpc_tiltmax_air.get()); // convert to radians!
-
-		// Check that the design parameters are inside the absolute maximum constraints
-		if (_param_mpc_xy_cruise.get() > _param_mpc_xy_vel_max.get()) {
-			_param_mpc_xy_cruise.set(_param_mpc_xy_vel_max.get());
-			_param_mpc_xy_cruise.commit();
-			mavlink_log_critical(&_mavlink_log_pub, "Cruise speed has been constrained by max speed");
-		}
-
-		if (_param_mpc_vel_manual.get() > _param_mpc_xy_vel_max.get()) {
-			_param_mpc_vel_manual.set(_param_mpc_xy_vel_max.get());
-			_param_mpc_vel_manual.commit();
-			mavlink_log_critical(&_mavlink_log_pub, "Manual speed has been constrained by max speed");
-		}
-
-		if (!_param_mpc_use_hte.get()) {
-			if (_param_mpc_thr_hover.get() > _param_mpc_thr_max.get() ||
-			    _param_mpc_thr_hover.get() < _param_mpc_thr_min.get()) {
-				_param_mpc_thr_hover.set(math::constrain(_param_mpc_thr_hover.get(), _param_mpc_thr_min.get(),
-							 _param_mpc_thr_max.get()));
-				_param_mpc_thr_hover.commit();
-				mavlink_log_critical(&_mavlink_log_pub, "Hover thrust has been constrained by min/max");
-			}
-
-			_control.updateHoverThrust(_param_mpc_thr_hover.get());
-		}
-
-		_flight_tasks.handleParameterUpdate();
-
-		// initialize vectors from params and enforce constraints
-		_param_mpc_tko_speed.set(math::min(_param_mpc_tko_speed.get(), _param_mpc_z_vel_max_up.get()));
-		_param_mpc_land_speed.set(math::min(_param_mpc_land_speed.get(), _param_mpc_z_vel_max_dn.get()));
-
-		// set trigger time for takeoff delay
-		_takeoff.setSpoolupTime(_param_mpc_spoolup_time.get());
-		_takeoff.setTakeoffRampTime(_param_mpc_tko_ramp_t.get());
-		_takeoff.generateInitialRampValue(_param_mpc_thr_hover.get(), _param_mpc_z_vel_p.get());
-
-		if (_wv_controller != nullptr) {
-			_wv_controller->update_parameters();
-		}
+	// Only switch the landing gear up if we are not landed and if
+	// the user switched from gear down to gear up.
+	// If the user had the switch in the gear up position and took off ignore it
+	// until he toggles the switch to avoid retracting the gear immediately on takeoff.
+	if (_landed) {
+		_gear_state_initialized = false;
 	}
-	*/
-	return OK;
+
+	float landing_gear = landing_gear_s::GEAR_DOWN; // default to down
+
+	if (_manual_control_sp.gear_switch == manual_control_setpoint_s::SWITCH_POS_ON && _gear_state_initialized) {
+		landing_gear = landing_gear_s::GEAR_UP;
+
+	} else if (_manual_control_sp.gear_switch == manual_control_setpoint_s::SWITCH_POS_OFF) {
+		// Switching the gear off does put it into a safe defined state
+		_gear_state_initialized = true;
+	}
+
+	return landing_gear;
 }
 
 void
-LeeControl::poll_subscriptions()
+LeeController::Run()
 {
 
-	/*
-	_vehicle_status_sub.update(&_vehicle_status);
-	_vehicle_land_detected_sub.update(&_vehicle_land_detected);
-	_control_mode_sub.update(&_control_mode);
-	_home_pos_sub.update(&_home_pos);
-
-	if (_att_sub.updated()) {
-		vehicle_attitude_s att;
-
-		if (_att_sub.copy(&att) && PX4_ISFINITE(att.q[0])) {
-			_states.yaw = Eulerf(Quatf(att.q)).psi();
-		}
-	}
-
-	if (_param_mpc_use_hte.get()) {
-		hover_thrust_estimate_s hte;
-
-		if (_hover_thrust_estimate_sub.update(&hte)) {
-			_control.updateHoverThrust(hte.hover_thrust);
-		}
-	}
-
-	*/
-}
-
-
-int
-LeeControl::print_status()
-{
-	if (_flight_tasks.isAnyTaskActive()) {
-		PX4_INFO("Running, active flight task: %i", _flight_tasks.getActiveTask());
-
-	} else {
-		PX4_INFO("Running, no flight task active");
-	}
-
-	perf_print_counter(_cycle_perf);
-
-	return 0;
-}
-
-void
-LeeControl::Run()
-{
+	printf("IN run\n");
 	if (should_exit()) {
-		_local_pos_sub.unregisterCallback();
+		_vehicle_angular_velocity_sub.unregisterCallback();
 		exit_and_cleanup();
 		return;
 	}
 
-	perf_begin(_cycle_perf);
+	perf_begin(_loop_perf);
 
-	if (_local_pos_sub.update(&_local_pos)) {
+	// Check if parameters have changed
+	if (_parameter_update_sub.updated()) {
+		// clear update
+		parameter_update_s param_update;
+		_parameter_update_sub.copy(&param_update);
 
-
-		//printf("Local pos: %f %f %f\n", (double)_local_pos.x, (double)_local_pos.y, (double)_local_pos.z);		
-		
-		poll_subscriptions();
-		parameters_update(false);
-
-		// set _dt in controllib Block - the time difference since the last loop iteration in seconds
-		const hrt_abstime time_stamp_now = hrt_absolute_time();
-		setDt((time_stamp_now - _time_stamp_last_loop) / 1e6f);
-		_time_stamp_last_loop = time_stamp_now;
-
-
-		//Publish PWM at the end!
-		//_pwm_out.timestamp = hrt_absolute_time();
-		//_pwm_out.noutputs = 4;
-		//_pwm_out.pwm_signal[0] = 1000;
-		//_pwm_out.pwm_signal[1] = 1000;
-		//_pwm_out.pwm_signal[2] = 1000;
-		//_pwm_out.pwm_signal[3] = 1000;
-		//_pwm_pub.publish( _pwm_out );
-
-
-
+		updateParams();
+		parameters_updated();
 	}
 
-		actuators.control[actuator_controls_s::INDEX_ROLL] 	 	= 1.5;
-		actuators.control[actuator_controls_s::INDEX_PITCH]	 	= 1.5;
-		actuators.control[actuator_controls_s::INDEX_YAW]	 	= 1.5;
-		actuators.control[actuator_controls_s::INDEX_THROTTLE]  = 1.5;
+	/* run controller on gyro changes */
+	vehicle_angular_velocity_s angular_velocity;
 
-		actuators.timestamp = hrt_absolute_time();
-		_actuators_0_pub.publish(actuators);
-//
-//
-		printf("time %d\n", actuators.timestamp );
-		//printf("[leee] Want to publish a control data: %f %f %f %f\n", (double)actuators.control[actuator_controls_s::INDEX_ROLL], 
-		//														(double)actuators.control[actuator_controls_s::INDEX_YAW], 
-		//														(double)actuators.control[actuator_controls_s::INDEX_THROTTLE], 
-		//														(double)actuators.control[actuator_controls_s::INDEX_ROLL]);
+	if (_vehicle_angular_velocity_sub.update(&angular_velocity)) {
+
+		// grab corresponding vehicle_angular_acceleration immediately after vehicle_angular_velocity copy
+		vehicle_angular_acceleration_s v_angular_acceleration{};
+		_vehicle_angular_acceleration_sub.copy(&v_angular_acceleration);
+
+		const hrt_abstime now = hrt_absolute_time();
+
+		// Guard against too small (< 0.2ms) and too large (> 20ms) dt's.
+		//const float dt = math::constrain(((now - _last_run) / 1e6f), 0.0002f, 0.02f);
+		_last_run = now;
+
+		const Vector3f angular_accel{v_angular_acceleration.xyz};
+		const Vector3f rates{angular_velocity.xyz};
+
+		/* check for updates in other topics */
+		_v_control_mode_sub.update(&_v_control_mode);
+
+		if (_vehicle_land_detected_sub.updated()) {
+			vehicle_land_detected_s vehicle_land_detected;
+
+			if (_vehicle_land_detected_sub.copy(&vehicle_land_detected)) {
+				_landed = vehicle_land_detected.landed;
+				_maybe_landed = vehicle_land_detected.maybe_landed;
+			}
+		}
+
+		_vehicle_status_sub.update(&_vehicle_status);
+
+		const bool manual_control_updated = _manual_control_sp_sub.update(&_manual_control_sp);
+
+		// generate the rate setpoint from sticks?
+		bool manual_rate_sp = false;
+
+		if (_v_control_mode.flag_control_manual_enabled &&
+		    !_v_control_mode.flag_control_altitude_enabled &&
+		    !_v_control_mode.flag_control_velocity_enabled &&
+		    !_v_control_mode.flag_control_position_enabled) {
+
+			// landing gear controlled from stick inputs if we are in Manual/Stabilized mode
+			//  limit landing gear update rate to 50 Hz
+			if (hrt_elapsed_time(&_landing_gear.timestamp) > 20_ms) {
+				_landing_gear.landing_gear = get_landing_gear_state();
+				_landing_gear.timestamp = hrt_absolute_time();
+				_landing_gear_pub.publish(_landing_gear);
+			}
+
+			if (!_v_control_mode.flag_control_attitude_enabled) {
+				manual_rate_sp = true;
+			}
+
+			// Check if we are in rattitude mode and the pilot is within the center threshold on pitch and roll
+			//  if true then use published rate setpoint, otherwise generate from manual_control_setpoint (like acro)
+			if (_v_control_mode.flag_control_rattitude_enabled) {
+				manual_rate_sp =
+					(fabsf(_manual_control_sp.y) > _param_mc_ratt_th.get()) ||
+					(fabsf(_manual_control_sp.x) > _param_mc_ratt_th.get());
+			}
+
+		} else {
+			_landing_gear_sub.update(&_landing_gear);
+		}
+
+		if (manual_rate_sp) {
+			if (manual_control_updated) {
+
+				// manual rates control - ACRO mode
+				const Vector3f man_rate_sp{
+					math::superexpo(_manual_control_sp.y, _param_mc_acro_expo.get(), _param_mc_acro_supexpo.get()),
+					math::superexpo(-_manual_control_sp.x, _param_mc_acro_expo.get(), _param_mc_acro_supexpo.get()),
+					math::superexpo(_manual_control_sp.r, _param_mc_acro_expo_y.get(), _param_mc_acro_supexpoy.get())};
+
+				_rates_sp = man_rate_sp.emult(_acro_rate_max);
+				_thrust_sp = _manual_control_sp.z;
+
+				// publish rate setpoint
+				vehicle_rates_setpoint_s v_rates_sp{};
+				v_rates_sp.roll = _rates_sp(0);
+				v_rates_sp.pitch = _rates_sp(1);
+				v_rates_sp.yaw = _rates_sp(2);
+				v_rates_sp.thrust_body[0] = 0.0f;
+				v_rates_sp.thrust_body[1] = 0.0f;
+				v_rates_sp.thrust_body[2] = -_thrust_sp;
+				v_rates_sp.timestamp = hrt_absolute_time();
+
+				_v_rates_sp_pub.publish(v_rates_sp);
+			}
+
+		} else {
+			// use rates setpoint topic
+			vehicle_rates_setpoint_s v_rates_sp;
+
+			if (_v_rates_sp_sub.update(&v_rates_sp)) {
+				_rates_sp(0) = v_rates_sp.roll;
+				_rates_sp(1) = v_rates_sp.pitch;
+				_rates_sp(2) = v_rates_sp.yaw;
+				_thrust_sp = -v_rates_sp.thrust_body[2];
+			}
+		}
+
+		// run the rate controller
+		if (_v_control_mode.flag_control_rates_enabled && !_actuators_0_circuit_breaker_enabled) {
+			//printf("armed: %d\n", _v_control_mode.flag_armed);
+			// reset integral if disarmed
+			if (!_v_control_mode.flag_armed || _vehicle_status.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
+			}
+
+			// update saturation status from mixer feedback
+			if (_motor_limits_sub.updated()) {
+				multirotor_motor_limits_s motor_limits;
+
+				if (_motor_limits_sub.copy(&motor_limits)) {
+					//MultirotorMixer::saturation_status saturation_status;
+					//saturation_status.value = motor_limits.saturation_status;
+					//_rate_control.setSaturationStatus(saturation_status);
+				}
+			}
+
+			// run rate controller
+			const Vector3f att_control; // = _rate_control.update(rates, _rates_sp, angular_accel, dt, _maybe_landed || _landed);
+
+			// publish rate controller status
+			rate_ctrl_status_s rate_ctrl_status{};
+			//_rate_control.getRateControlStatus(rate_ctrl_status);
+			rate_ctrl_status.timestamp = hrt_absolute_time();
+			_controller_status_pub.publish(rate_ctrl_status);
+
+			// publish actuator controls
+			actuator_controls_s actuators{};
+			actuators.control[actuator_controls_s::INDEX_ROLL] = PX4_ISFINITE(att_control(0)) ? att_control(0) : 0.0f;
+			actuators.control[actuator_controls_s::INDEX_PITCH] = PX4_ISFINITE(att_control(1)) ? att_control(1) : 0.0f;
+			actuators.control[actuator_controls_s::INDEX_YAW] = PX4_ISFINITE(att_control(2)) ? att_control(2) : 0.0f;
+			actuators.control[actuator_controls_s::INDEX_THROTTLE] = PX4_ISFINITE(_thrust_sp) ? _thrust_sp : 0.0f;
+			actuators.control[actuator_controls_s::INDEX_LANDING_GEAR] = (float)_landing_gear.landing_gear;
+			actuators.timestamp_sample = angular_velocity.timestamp_sample;
+
+			// scale effort by battery status if enabled
+			if (_param_mc_bat_scale_en.get()) {
+				if (_battery_status_sub.updated()) {
+					battery_status_s battery_status;
+
+					if (_battery_status_sub.copy(&battery_status)) {
+						_battery_status_scale = battery_status.scale;
+					}
+				}
+
+				if (_battery_status_scale > 0.0f) {
+					for (int i = 0; i < 4; i++) {
+						actuators.control[i] *= _battery_status_scale;
+					}
+				}
+			}
+
+			actuators.timestamp = hrt_absolute_time();
+			actuators.control[actuator_controls_s::INDEX_ROLL] 	 	= 1.5;
+			actuators.control[actuator_controls_s::INDEX_PITCH]	 	= 1.5;
+			actuators.control[actuator_controls_s::INDEX_YAW]	 	= 1.5;
+			actuators.control[actuator_controls_s::INDEX_THROTTLE]  = 1.5;
+
+			_actuators_0_pub.publish(actuators);
 
 
-	perf_end(_cycle_perf);
+			//printf("Want to publish a control data: %f %f %f %f\n", (double)actuators.control[actuator_controls_s::INDEX_ROLL], 
+			//														(double)actuators.control[actuator_controls_s::INDEX_YAW], 
+			//														(double)actuators.control[actuator_controls_s::INDEX_THROTTLE], 
+			//														(double)actuators.control[actuator_controls_s::INDEX_ROLL]);
+
+
+
+		} else if (_v_control_mode.flag_control_termination_enabled) {
+			if (!_vehicle_status.is_vtol) {
+				// publish actuator controls
+				actuator_controls_s actuators{};
+				actuators.timestamp = hrt_absolute_time();
+				_actuators_0_pub.publish(actuators);
+			}
+		}
+	}
+
+	perf_end(_loop_perf);
 }
 
-void
-LeeControl::start_flight_task() {
-
-	/*
-	bool task_failure = false;
-	bool should_disable_task = true;
-	int prev_failure_count = _task_failure_count;
-
-	// Do not run any flight task for VTOLs in fixed-wing mode
-	if (_vehicle_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_FIXED_WING) {
-		_flight_tasks.switchTask(FlightTaskIndex::None);
-		return;
-	}
-
-	if (_vehicle_status.in_transition_mode) {
-		should_disable_task = false;
-		FlightTaskError error = _flight_tasks.switchTask(FlightTaskIndex::Transition);
-
-		if (error != FlightTaskError::NoError) {
-			if (prev_failure_count == 0) {
-				PX4_WARN("Transition activation failed with error: %s", _flight_tasks.errorToString(error));
-			}
-
-			task_failure = true;
-			_task_failure_count++;
-
-		} else {
-			// we want to be in this mode, reset the failure count
-			_task_failure_count = 0;
-		}
-
-		return;
-	}
-
-	// offboard
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD
-	    && (_control_mode.flag_control_altitude_enabled ||
-		_control_mode.flag_control_position_enabled ||
-		_control_mode.flag_control_climb_rate_enabled ||
-		_control_mode.flag_control_velocity_enabled ||
-		_control_mode.flag_control_acceleration_enabled)) {
-
-		should_disable_task = false;
-		FlightTaskError error = _flight_tasks.switchTask(FlightTaskIndex::Offboard);
-
-		if (error != FlightTaskError::NoError) {
-			if (prev_failure_count == 0) {
-				PX4_WARN("Offboard activation failed with error: %s", _flight_tasks.errorToString(error));
-			}
-
-			task_failure = true;
-			_task_failure_count++;
-
-		} else {
-			// we want to be in this mode, reset the failure count
-			_task_failure_count = 0;
-		}
-	}
-
-	// Auto-follow me
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_AUTO_FOLLOW_TARGET) {
-		should_disable_task = false;
-		FlightTaskError error = _flight_tasks.switchTask(FlightTaskIndex::AutoFollowMe);
-
-		if (error != FlightTaskError::NoError) {
-			if (prev_failure_count == 0) {
-				PX4_WARN("Follow-Me activation failed with error: %s", _flight_tasks.errorToString(error));
-			}
-
-			task_failure = true;
-			_task_failure_count++;
-
-		} else {
-			// we want to be in this mode, reset the failure count
-			_task_failure_count = 0;
-		}
-
-	} else if (_control_mode.flag_control_auto_enabled) {
-		// Auto related maneuvers
-		should_disable_task = false;
-		FlightTaskError error = FlightTaskError::NoError;
-
-		error =  _flight_tasks.switchTask(FlightTaskIndex::AutoLineSmoothVel);
-
-		if (error != FlightTaskError::NoError) {
-			if (prev_failure_count == 0) {
-				PX4_WARN("Auto activation failed with error: %s", _flight_tasks.errorToString(error));
-			}
-
-			task_failure = true;
-			_task_failure_count++;
-
-		} else {
-			// we want to be in this mode, reset the failure count
-			_task_failure_count = 0;
-		}
-
-	} else if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_DESCEND) {
-
-		// Emergency descend
-		should_disable_task = false;
-		FlightTaskError error = FlightTaskError::NoError;
-
-		error =  _flight_tasks.switchTask(FlightTaskIndex::Descend);
-
-		if (error != FlightTaskError::NoError) {
-			if (prev_failure_count == 0) {
-				PX4_WARN("Descend activation failed with error: %s", _flight_tasks.errorToString(error));
-			}
-
-			task_failure = true;
-			_task_failure_count++;
-
-		} else {
-			// we want to be in this mode, reset the failure count
-			_task_failure_count = 0;
-		}
-
-	}
-
-	// manual position control
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_POSCTL || task_failure) {
-		should_disable_task = false;
-		FlightTaskError error = FlightTaskError::NoError;
-
-		switch (_param_mpc_pos_mode.get()) {
-		case 1:
-			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualPositionSmooth);
-			break;
-
-		case 3:
-			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualPositionSmoothVel);
-			break;
-
-		default:
-			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualPosition);
-			break;
-		}
-
-		if (error != FlightTaskError::NoError) {
-			if (prev_failure_count == 0) {
-				PX4_WARN("Position-Ctrl activation failed with error: %s", _flight_tasks.errorToString(error));
-			}
-
-			task_failure = true;
-			_task_failure_count++;
-
-		} else {
-			check_failure(task_failure, vehicle_status_s::NAVIGATION_STATE_POSCTL);
-			task_failure = false;
-		}
-	}
-
-	// manual altitude control
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_ALTCTL || task_failure) {
-		should_disable_task = false;
-		FlightTaskError error = FlightTaskError::NoError;
-
-		switch (_param_mpc_pos_mode.get()) {
-		case 1:
-			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualAltitudeSmooth);
-			break;
-
-		case 3:
-			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualAltitudeSmoothVel);
-			break;
-
-		default:
-			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualAltitude);
-			break;
-		}
-
-		if (error != FlightTaskError::NoError) {
-			if (prev_failure_count == 0) {
-				PX4_WARN("Altitude-Ctrl activation failed with error: %s", _flight_tasks.errorToString(error));
-			}
-
-			task_failure = true;
-			_task_failure_count++;
-
-		} else {
-			check_failure(task_failure, vehicle_status_s::NAVIGATION_STATE_ALTCTL);
-			task_failure = false;
-		}
-	}
-
-	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_ORBIT) {
-		should_disable_task = false;
-	}
-
-	// check task failure
-	if (task_failure) {
-
-		// for some reason no flighttask was able to start.
-		// go into failsafe flighttask
-		FlightTaskError error = _flight_tasks.switchTask(FlightTaskIndex::Failsafe);
-
-		if (error != FlightTaskError::NoError) {
-			// No task was activated.
-			_flight_tasks.switchTask(FlightTaskIndex::None);
-		}
-
-	} else if (should_disable_task) {
-		_flight_tasks.switchTask(FlightTaskIndex::None);
-	}
-	*/
-}
-
-
-void LeeControl::check_failure(bool task_failure, uint8_t nav_state) {
-	/*
-	if (!task_failure) {
-		// we want to be in this mode, reset the failure count
-		_task_failure_count = 0;
-
-	} else if (_task_failure_count > NUM_FAILURE_TRIES) {
-		// tell commander to switch mode
-		PX4_WARN("Previous flight task failed, switching to mode %d", nav_state);
-		send_vehicle_cmd_do(nav_state);
-		_task_failure_count = 0; // avoid immediate resending of a vehicle command in the next iteration
-	}
-	*/
-}
-
-void LeeControl::send_vehicle_cmd_do(uint8_t nav_state)
+int LeeController::task_spawn(int argc, char *argv[])
 {
-	vehicle_command_s command{};
-	command.timestamp = hrt_absolute_time();
-	command.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
-	command.param1 = (float)1; // base mode
-	command.param3 = (float)0; // sub mode
-	command.target_system = 1;
-	command.target_component = 1;
-	command.source_system = 1;
-	command.source_component = 1;
-	command.confirmation = false;
-	command.from_external = false;
+	bool vtol = false;
 
-	// set the main mode
-	switch (nav_state) {
-	case vehicle_status_s::NAVIGATION_STATE_STAB:
-		command.param2 = (float)PX4_CUSTOM_MAIN_MODE_STABILIZED;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_ALTCTL:
-		command.param2 = (float)PX4_CUSTOM_MAIN_MODE_ALTCTL;
-		break;
-
-	case vehicle_status_s::NAVIGATION_STATE_AUTO_LOITER:
-		command.param2 = (float)PX4_CUSTOM_MAIN_MODE_AUTO;
-		command.param3 = (float)PX4_CUSTOM_SUB_MODE_AUTO_LOITER;
-		break;
-
-	default: //vehicle_status_s::NAVIGATION_STATE_POSCTL
-		command.param2 = (float)PX4_CUSTOM_MAIN_MODE_POSCTL;
-		break;
+	if (argc > 1) {
+		if (strcmp(argv[1], "vtol") == 0) {
+			vtol = true;
+		}
 	}
 
-	// publish the vehicle command
-	_pub_vehicle_command.publish(command);
-}
-
-int LeeControl::task_spawn(int argc, char *argv[]) {
-
-	LeeControl *instance = new LeeControl();
+	LeeController *instance = new LeeController(vtol);
 
 	if (instance) {
 		_object.store(instance);
 		_task_id = task_id_is_work_queue;
 
 		if (instance->init()) {
-
 			return PX4_OK;
 		}
 
@@ -547,21 +338,36 @@ int LeeControl::task_spawn(int argc, char *argv[]) {
 	return PX4_ERROR;
 }
 
-int LeeControl::custom_command(int argc, char *argv[])
+int LeeController::custom_command(int argc, char *argv[])
 {
 	return print_usage("unknown command");
 }
 
-int LeeControl::print_usage(const char *reason)
+int LeeController::print_usage(const char *reason)
 {
 	if (reason) {
 		PX4_WARN("%s\n", reason);
 	}
 
+	PRINT_MODULE_DESCRIPTION(
+		R"DESCR_STR(
+### Description
+This implements the multicopter rate controller. It takes rate setpoints (in acro mode
+via `manual_control_setpoint` topic) as inputs and outputs actuator control messages.
+
+The controller has a PID loop for angular rate error.
+
+)DESCR_STR");
+
+	PRINT_MODULE_USAGE_NAME("mc_rate_control", "controller");
+	PRINT_MODULE_USAGE_COMMAND("start");
+	PRINT_MODULE_USAGE_ARG("vtol", "VTOL mode", true);
+	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
+
 	return 0;
 }
 
-int lee_controller_main(int argc, char *argv[])
+extern "C" __EXPORT int lee_controller_main(int argc, char *argv[])
 {
-	return LeeControl::main(argc, argv);
+	return LeeController::main(argc, argv);
 }

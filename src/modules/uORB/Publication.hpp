@@ -67,6 +67,8 @@ public:
 	 */
 	bool publish(const T &data)
 	{
+
+		
 		if (_handle != nullptr) {
 			return (orb_publish(_meta, _handle, &data) == PX4_OK);
 
