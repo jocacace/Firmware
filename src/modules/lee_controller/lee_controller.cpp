@@ -45,7 +45,7 @@ using math::radians;
 LeeController::LeeController(bool vtol) :
 	ModuleParams(nullptr),
 	WorkItem(MODULE_NAME, px4::wq_configurations::rate_ctrl),
-	_actuators_0_pub(vtol ? ORB_ID(actuator_controls_virtual_mc) : ORB_ID(actuator_controls_0)),
+	_actuators_0_pub(ORB_ID(actuator_controls_0)),
 	_loop_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle"))
 {
 	_vehicle_status.vehicle_type = vehicle_status_s::VEHICLE_TYPE_ROTARY_WING;
@@ -287,10 +287,10 @@ LeeController::Run()
 			_actuators_0_pub.publish(actuators);
 
 
-			//printf("Want to publish a control data: %f %f %f %f\n", (double)actuators.control[actuator_controls_s::INDEX_ROLL], 
-			//														(double)actuators.control[actuator_controls_s::INDEX_YAW], 
-			//														(double)actuators.control[actuator_controls_s::INDEX_THROTTLE], 
-			//														(double)actuators.control[actuator_controls_s::INDEX_ROLL]);
+			printf("Want to publish a control data: %f %f %f %f\n", (double)actuators.control[actuator_controls_s::INDEX_ROLL], 
+																	(double)actuators.control[actuator_controls_s::INDEX_YAW], 
+																	(double)actuators.control[actuator_controls_s::INDEX_THROTTLE], 
+																	(double)actuators.control[actuator_controls_s::INDEX_ROLL]);
 
 
 
