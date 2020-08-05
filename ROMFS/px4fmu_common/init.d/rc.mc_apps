@@ -51,20 +51,20 @@ fi
 #
 # Start Multicopter Rate Controller.
 #
-#mc_rate_control start
+mc_rate_control start
 
 #
 # Start Multicopter Attitude Controller.
 #
-#mc_att_control start
-pwm_out_test start
+mc_att_control start
+#pwm_out_test start
 lee_controller start
 
 #
 # Start Multicopter Position Controller.
-#
+
 mc_hover_thrust_estimator start
-#mc_pos_control start
+mc_pos_control start
 
 #
 # Start Multicopter Land Detector.

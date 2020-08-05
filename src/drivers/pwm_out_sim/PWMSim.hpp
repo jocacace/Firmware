@@ -47,7 +47,7 @@
 class PWMSim : public cdev::CDev, public ModuleBase<PWMSim>, public OutputModuleInterface
 {
 public:
-	PWMSim(bool hil_mode_enabled);
+	PWMSim(bool hil_mode_enabled, int p);
 
 	/** @see ModuleBase */
 	static int task_spawn(int argc, char *argv[]);

@@ -39,7 +39,7 @@
 #include <uORB/Subscription.hpp>
 #include <uORB/topics/parameter_update.h>
 
-PWMSim::PWMSim(bool hil_mode_enabled) :
+PWMSim::PWMSim(bool hil_mode_enabled, int p) :
 	CDev(PWM_OUTPUT0_DEVICE_PATH),
 	OutputModuleInterface(MODULE_NAME, px4::wq_configurations::hp_default)
 {
@@ -56,6 +56,7 @@ PWMSim::PWMSim(bool hil_mode_enabled) :
 void
 PWMSim::Run()
 {
+
 	if (should_exit()) {
 		ScheduleClear();
 		_mixing_output.unregister();
@@ -254,7 +255,7 @@ PWMSim::task_spawn(int argc, char *argv[])
 		}
 	}
 
-	PWMSim *instance = new PWMSim(hil_mode);
+	PWMSim *instance = new PWMSim(hil_mode, 1);
 
 	if (!instance) {
 		PX4_ERR("alloc failed");

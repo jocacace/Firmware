@@ -1,6 +1,7 @@
 /****************************************************************************
  *
- *   Copyright (c) 2013-2019 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2020 Jonathan Cacace <jonathan.cacace@gmail.com>
+ *	 All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -30,7 +31,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  *
  ****************************************************************************/
-
+ 
 #include "lee_controller.hpp"
 
 #include <drivers/drv_hrt.h>
@@ -42,38 +43,458 @@ using namespace matrix;
 using namespace time_literals;
 using math::radians;
 
-LeeController::LeeController(bool vtol) :
+LeeController::LeeController() :
 	ModuleParams(nullptr),
 	WorkItem(MODULE_NAME, px4::wq_configurations::rate_ctrl),
 	_actuators_0_pub(ORB_ID(actuator_controls_0)),
-	_loop_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle"))
-{
+	_loop_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")) {
 	_vehicle_status.vehicle_type = vehicle_status_s::VEHICLE_TYPE_ROTARY_WING;
 
 	parameters_updated();
 }
 
-LeeController::~LeeController()
-{
+LeeController::~LeeController() {
 	perf_free(_loop_perf);
 }
 
 bool
-LeeController::init()
-{
-	if (!_vehicle_angular_velocity_sub.registerCallback()) {
+LeeController::init() {
+	//if (!_vehicle_angular_velocity_sub.registerCallback()) {
+	if (!_vehicle_attitude_sub.registerCallback()) {
 		PX4_ERR("vehicle_angular_velocity callback registration failed!");
 		return false;
 	}
-
 	return true;
+}
+
+
+
+void LeeController::check_failure(bool task_failure, uint8_t nav_state)
+{
+	if (!task_failure) {
+		// we want to be in this mode, reset the failure count
+		_task_failure_count = 0;
+
+	} else if (_task_failure_count > NUM_FAILURE_TRIES) {
+		// tell commander to switch mode
+		PX4_WARN("Previous flight task failed, switching to mode %d", nav_state);
+		send_vehicle_cmd_do(nav_state);
+		_task_failure_count = 0; // avoid immediate resending of a vehicle command in the next iteration
+	}
+}
+
+
+Matrix3f QuatToMat( float qw, float  qx, float  qy, float  qz ){
+
+	Matrix3f Rot;
+	float s = qw;
+	float x = qx;
+	float y = qy;
+	float z = qz;
+
+	Rot(0,0) = 1-2*(y*y+z*z);
+	Rot(0,1) = 2*(x*y-s*z);
+	Rot(0,2) = 2*(x*z+s*y);
+
+	Rot(1,0) = 2*(x*y+s*z);
+	Rot(1,1) = 1-2*(x*x+z*z);
+	Rot(1,2) = 2*(y*z-s*x);
+
+	Rot(2,0) = 2*(x*z-s*y);
+	Rot(2,1) = 2*(y*z+s*x);
+	Rot(2,2) = 1-2*(x*x+y*y);
+
+	return Rot;
+}
+
+
+
+void LeeController::send_vehicle_cmd_do(uint8_t nav_state)
+{
+	vehicle_command_s command{};
+	command.timestamp = hrt_absolute_time();
+	command.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
+	command.param1 = (float)1; // base mode
+	command.param3 = (float)0; // sub mode
+	command.target_system = 1;
+	command.target_component = 1;
+	command.source_system = 1;
+	command.source_component = 1;
+	command.confirmation = false;
+	command.from_external = false;
+
+	// set the main mode
+	switch (nav_state) {
+	case vehicle_status_s::NAVIGATION_STATE_STAB:
+		command.param2 = (float)PX4_CUSTOM_MAIN_MODE_STABILIZED;
+		break;
+
+	case vehicle_status_s::NAVIGATION_STATE_ALTCTL:
+		command.param2 = (float)PX4_CUSTOM_MAIN_MODE_ALTCTL;
+		break;
+
+	case vehicle_status_s::NAVIGATION_STATE_AUTO_LOITER:
+		command.param2 = (float)PX4_CUSTOM_MAIN_MODE_AUTO;
+		command.param3 = (float)PX4_CUSTOM_SUB_MODE_AUTO_LOITER;
+		break;
+
+	default: //vehicle_status_s::NAVIGATION_STATE_POSCTL
+		command.param2 = (float)PX4_CUSTOM_MAIN_MODE_POSCTL;
+		break;
+	}
+
+	// publish the vehicle command
+	_pub_vehicle_command.publish(command);
+}
+
+
+
+void
+LeeController::start_flight_task()
+{
+	FlightTaskError error;
+	bool task_failure = false;
+	bool should_disable_task = true;
+	int prev_failure_count = _task_failure_count;
+
+	if (_vehicle_status.in_transition_mode) {
+		should_disable_task = false;
+		error = _flight_tasks.switchTask(FlightTaskIndex::Transition);
+
+		if (error != FlightTaskError::NoError) {
+			if (prev_failure_count == 0) {
+				PX4_WARN("Transition activation failed with error: %s", _flight_tasks.errorToString(error));
+			}
+
+			task_failure = true;
+			_task_failure_count++;
+
+		} else {
+			// we want to be in this mode, reset the failure count
+			_task_failure_count = 0;
+		}
+
+		return;
+	}
+
+	
+	// offboard
+	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_OFFBOARD
+	    && (_control_mode.flag_control_altitude_enabled ||
+		_control_mode.flag_control_position_enabled ||
+		_control_mode.flag_control_climb_rate_enabled ||
+		_control_mode.flag_control_velocity_enabled ||
+		_control_mode.flag_control_acceleration_enabled)) {
+
+		should_disable_task = false;
+		error = _flight_tasks.switchTask(FlightTaskIndex::Offboard);
+
+		if (error != FlightTaskError::NoError) {
+			if (prev_failure_count == 0) {
+				PX4_WARN("Offboard activation failed with error: %s", _flight_tasks.errorToString(error));
+			}
+
+			task_failure = true;
+			_task_failure_count++;
+
+		} else {
+			// we want to be in this mode, reset the failure count
+			_task_failure_count = 0;
+		}
+	}
+
+
+	if (_control_mode.flag_control_auto_enabled) {
+		// Auto related maneuvers
+		should_disable_task = false;
+		error = FlightTaskError::NoError;
+		error =  _flight_tasks.switchTask(FlightTaskIndex::AutoLineSmoothVel);
+
+		if (error != FlightTaskError::NoError) {
+			if (prev_failure_count == 0) {
+				PX4_WARN("Auto activation failed with error: %s", _flight_tasks.errorToString(error));
+			}
+
+			task_failure = true;
+			_task_failure_count++;
+
+		} else {
+			// we want to be in this mode, reset the failure count
+			_task_failure_count = 0;
+		}
+	}
+
+	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_DESCEND) {
+
+		// Emergency descend
+		should_disable_task = false;
+		error = FlightTaskError::NoError;
+
+		error =  _flight_tasks.switchTask(FlightTaskIndex::Descend);
+
+		if (error != FlightTaskError::NoError) {
+			if (prev_failure_count == 0) {
+				PX4_WARN("Descend activation failed with error: %s", _flight_tasks.errorToString(error));
+			}
+
+			task_failure = true;
+			_task_failure_count++;
+
+		} else {
+			// we want to be in this mode, reset the failure count
+			_task_failure_count = 0;
+		}
+
+	}
+
+	// manual position control
+	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_POSCTL || task_failure) {
+		should_disable_task = false;
+		error = FlightTaskError::NoError;
+
+		switch (_param_mpc_pos_mode.get()) {
+		case 1:
+			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualPositionSmooth);
+			break;
+
+		case 3:
+			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualPositionSmoothVel);
+			break;
+
+		default:
+			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualPosition);
+			break;
+		}
+
+		if (error != FlightTaskError::NoError) {
+			if (prev_failure_count == 0) {
+				PX4_WARN("Position-Ctrl activation failed with error: %s", _flight_tasks.errorToString(error));
+			}
+
+			task_failure = true;
+			_task_failure_count++;
+
+		} 
+		else {
+			check_failure(task_failure, vehicle_status_s::NAVIGATION_STATE_POSCTL);
+			task_failure = false;
+		}
+	}
+	
+	// manual altitude control
+	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_ALTCTL || task_failure) {
+		should_disable_task = false;
+		error = FlightTaskError::NoError;
+
+		switch (_param_mpc_pos_mode.get()) {
+		case 1:
+			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualAltitudeSmooth);
+			break;
+
+		case 3:
+			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualAltitudeSmoothVel);
+			break;
+
+		default:
+			error =  _flight_tasks.switchTask(FlightTaskIndex::ManualAltitude);
+			break;
+		}
+
+		if (error != FlightTaskError::NoError) {
+			if (prev_failure_count == 0) {
+				PX4_WARN("Altitude-Ctrl activation failed with error: %s", _flight_tasks.errorToString(error));
+			}
+
+			task_failure = true;
+			_task_failure_count++;
+
+		} 
+		else {
+			check_failure(task_failure, vehicle_status_s::NAVIGATION_STATE_ALTCTL);
+			task_failure = false;
+		}
+	}
+
+	if (_vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_ORBIT) {
+		should_disable_task = false;
+	}
+	
+	// check task failure
+	if (task_failure) {
+
+		// for some reason no flighttask was able to start.
+		// go into failsafe flighttask
+		error = _flight_tasks.switchTask(FlightTaskIndex::Failsafe);
+
+		if (error != FlightTaskError::NoError) {
+			// No task was activated.
+			_flight_tasks.switchTask(FlightTaskIndex::None);
+		}
+
+	} 
+	else if (should_disable_task) {
+		_flight_tasks.switchTask(FlightTaskIndex::None);
+	}
+	
 }
 
 void
 LeeController::parameters_updated()
 {
 	_actuators_0_circuit_breaker_enabled = circuit_breaker_enabled_by_val(_param_cbrk_rate_ctrl.get(), CBRK_RATE_CTRL_KEY);
-}
+
+
+	/*
+	I: 
+	0.0347563         0         0         0
+		0 0.0458929         0         0
+		0         0    0.0977         0
+		0         0         0         1
+	Iinv: 28.7718      -0       0      -0
+		-0 21.7899      -0       0
+		0      -0 10.2354      -0
+		-0       0      -0       1
+	_attitude_gain:    2
+	3
+	0.15
+	_angular_rate_gain:  0.4
+	0.52
+	0.18
+	normalized_attitude_gain: 57.5435
+	65.3696
+	1.53531
+	normalized_angular_rate_gain: 11.5087
+	11.3307
+	1.84237
+	*/
+
+    SquareMatrix<float, 4> T_i;
+	T_i(0,0) = 0.03475;
+	T_i(1,1) = 0.04589;
+	T_i(2,2) = 0.0977;
+	T_i(3,3) = 1.0;
+	
+    SquareMatrix<float, 3> I;
+	I(0,0) = 0.03475;
+	I(1,1) = 0.04589;
+	I(2,2) = 0.0977;
+	
+
+
+	//Vector3f attitude_gain = Vector3f(2.0, 3.0, 0.15);
+	//Vector3f angular_rate_gain = Vector3f(0.4, 0.52, 0.18);
+
+	//for(int i=0; i<3; i++ ) {
+	//	for( int j=0; j<3; j++ ) {
+	//		printf("M[%d,%d]: %f - ", i, j, (double)I.I()(i,j));
+	//	}
+	//}
+
+	Matrix<float, 1, 3> attitude_gain;
+	attitude_gain(0,0) = 2.0;
+	attitude_gain(0,1) = 3.0;
+	attitude_gain(0,2) = 0.15;
+	Matrix<float, 1, 3> normalized_attitude_gain = attitude_gain*I.I(); //  I.I();
+
+	_normalized_attitude_gain(0) = normalized_attitude_gain(0,0);
+	_normalized_attitude_gain(1) = normalized_attitude_gain(0,1);
+	_normalized_attitude_gain(2) = normalized_attitude_gain(0,2);
+
+
+	Matrix<float, 1, 3> angular_rate_gain;
+	angular_rate_gain(0,0) = 0.4;
+	angular_rate_gain(0,1) = 0.52;
+	angular_rate_gain(0,2) = 0.18;
+	Matrix<float, 1, 3> normalized_angular_rate_gain = angular_rate_gain*I.I();
+
+	_normalized_angular_rate_gain(0) = normalized_angular_rate_gain(0,0);
+	_normalized_angular_rate_gain(1) = normalized_angular_rate_gain(0,1);
+	_normalized_angular_rate_gain(2) = normalized_angular_rate_gain(0,2);
+
+
+    int i=0;
+    double rotor_angle = -0.533708;
+    double arm_length = 0.255;
+    double force_k = 8.54858e-06;
+    double moment_k = 1.6e-2;
+    double direction = 1.0;
+
+    _allocation_M(0, i) =  sin( rotor_angle ) * arm_length * force_k;
+    _allocation_M(1, i) = cos( rotor_angle ) * arm_length * force_k;
+    _allocation_M(2, i) = direction * force_k * moment_k;
+    _allocation_M(3, i) = -force_k;
+
+    i++;
+    rotor_angle = 2.565;
+    arm_length = 0.238;
+    direction = 1.0;
+    _allocation_M(0, i) =  sin( rotor_angle ) * arm_length * force_k;
+    _allocation_M(1, i) = cos( rotor_angle ) * arm_length * force_k;
+    _allocation_M(2, i) = direction * force_k * moment_k;
+    _allocation_M(3, i) = -force_k;
+
+
+    i++;
+    rotor_angle = 0.533708;
+    arm_length = 0.255;
+    direction = -1.0;
+    _allocation_M(0, i) =  sin( rotor_angle ) * arm_length * force_k;
+    _allocation_M(1, i) = cos( rotor_angle ) * arm_length * force_k;
+    _allocation_M(2, i) = direction * force_k * moment_k;
+    _allocation_M(3, i) = -force_k;
+
+
+    i++; 
+    rotor_angle = -2.565;
+    arm_length = 0.238;
+    direction = -1.0;
+    _allocation_M(0, i) =  sin( rotor_angle ) * arm_length * force_k;
+    _allocation_M(1, i) = cos( rotor_angle ) * arm_length * force_k;
+    _allocation_M(2, i) = direction * force_k * moment_k;
+    _allocation_M(3, i) = -force_k;
+
+
+	matrix::SquareMatrix<float, 4> allocation_transpose;
+
+
+  	//_wd2rpm = _allocation_M.transpose() * (allocation_M*allocation_M.transpose()).inverse()*_I;    
+
+	allocation_transpose = _allocation_M*_allocation_M.transpose()* T_i;
+	//allocation_transpose = _allocation_M.transpose() * allocation_transpose * T_i;
+	//_wd2rpm = allocation_transpose;
+
+	printf("_allocation_M\n");	
+	for(int k=0; k<4; k++ ) {
+		for( int j=0; j<4; j++ ) 
+			printf("%f ", (double)_allocation_M(k,j));
+		printf("\n");
+	}
+			
+
+
+	//_wd2rpm = _allocation_M.transpose() * (_allocation_M*_allocation_M.transpose()).I()*T_i;    
+	_wd2rpm (0,0) = -7834.56; 
+	_wd2rpm (0,1) = 6405.41; 
+	_wd2rpm (0,2) = 178593;
+	_wd2rpm (0,3) = -27847.8;
+ 
+ 	_wd2rpm (1,0) = 7834.56; 
+	_wd2rpm (1,1) = -6405.41;   
+	_wd2rpm (1,2) = 178557; 
+	_wd2rpm (1,3) = -30641.5;
+ 
+ 	_wd2rpm (2,0) = 7834.56;  
+	_wd2rpm (2,1) = 6405.41;  
+	_wd2rpm (2,2) = -178593; 
+	_wd2rpm (2,3) = -27847.8;
+
+	_wd2rpm (3,0) = -7834.56; 
+	_wd2rpm (3,1) = -6405.41;  
+	_wd2rpm (3,2) = -178557; 
+	_wd2rpm (3,3) = -30641.5;
+
+	
+} //TODO: add parameters
 
 float
 LeeController::get_landing_gear_state()
@@ -99,13 +520,43 @@ LeeController::get_landing_gear_state()
 	return landing_gear;
 }
 
-void
-LeeController::Run()
-{
 
-	printf("IN run\n");
+
+void
+LeeController::poll_subscriptions()
+{
+	_vehicle_status_sub.update(&_vehicle_status);
+	_vehicle_land_detected_sub.update(&_vehicle_land_detected);
+	_control_mode_sub.update(&_control_mode);
+	_home_pos_sub.update(&_home_pos);
+
+	if (_att_sub.updated()) {
+		vehicle_attitude_s att;
+
+		if (_att_sub.copy(&att) && PX4_ISFINITE(att.q[0])) {
+			//TODO ??? _states.yaw = Eulerf(Quatf(att.q)).psi();
+		}
+	}
+
+	/*
+	if (_param_mpc_use_hte.get()) {
+		hover_thrust_estimate_s hte;
+
+		if (_hover_thrust_estimate_sub.update(&hte)) {
+			_control.updateHoverThrust(hte.hover_thrust);
+		}
+	}
+	*/
+
+}
+
+
+void
+LeeController::Run() {
+
 	if (should_exit()) {
-		_vehicle_angular_velocity_sub.unregisterCallback();
+		//Unregister from Callbacks!
+		//_vehicle_angular_velocity_sub.unregisterCallback();
 		exit_and_cleanup();
 		return;
 	}
@@ -122,202 +573,299 @@ LeeController::Run()
 		parameters_updated();
 	}
 
-	/* run controller on gyro changes */
-	vehicle_angular_velocity_s angular_velocity;
+	poll_subscriptions();
 
-	if (_vehicle_angular_velocity_sub.update(&angular_velocity)) {
 
-		// grab corresponding vehicle_angular_acceleration immediately after vehicle_angular_velocity copy
-		vehicle_angular_acceleration_s v_angular_acceleration{};
-		_vehicle_angular_acceleration_sub.copy(&v_angular_acceleration);
+	//TODO:   - rimuovere mixer - DONE
+	//        - Pubblicare PWM -> su actuators control (questo permette di continuare il flow con simulator mavlink  (in simu, da capire come in reale)) - DONE 
 
-		const hrt_abstime now = hrt_absolute_time();
+	//External loop: position controller
+	//if (_local_pos_sub.update(&_local_pos)) {
+	//}
 
-		// Guard against too small (< 0.2ms) and too large (> 20ms) dt's.
-		//const float dt = math::constrain(((now - _last_run) / 1e6f), 0.0002f, 0.02f);
-		_last_run = now;
+	// switch to the required flighttask
+	start_flight_task();
 
-		const Vector3f angular_accel{v_angular_acceleration.xyz};
-		const Vector3f rates{angular_velocity.xyz};
+	//if (_flight_tasks.isAnyTaskActive()) 
+	//	PX4_INFO("Running, lee_controller] flight task: %i", _flight_tasks.getActiveTask());
 
-		/* check for updates in other topics */
-		_v_control_mode_sub.update(&_v_control_mode);
+	// check if any task is active
+	if (_flight_tasks.isAnyTaskActive()) {
 
-		if (_vehicle_land_detected_sub.updated()) {
-			vehicle_land_detected_s vehicle_land_detected;
+		if (!_flight_tasks.update()) {
+			// FAILSAFE
+			// Task was not able to update correctly. Do Failsafe.
+			//failsafe(setpoint, _states, false, !was_in_failsafe);
+			//TBA 
+		} 
+		else {
+			vehicle_local_position_setpoint_s setpoint = FlightTask::empty_setpoint;
+			setpoint = _flight_tasks.getPositionSetpoint();
+			//printf("Goal setpoint: %f %f %f\n", (double)setpoint.x, (double)setpoint.y, (double)setpoint.z);
+			//Internal loop: attitude controllers	
+			float des_yaw = 1.57;
+			Matrix3f R_des;
 
-			if (_vehicle_land_detected_sub.copy(&vehicle_land_detected)) {
-				_landed = vehicle_land_detected.landed;
-				_maybe_landed = vehicle_land_detected.maybe_landed;
-			}
-		}
+			//Local pose - Outer loop
+			if (_local_pos_sub.update(&_local_pos)) {
+			
+				_kp = Vector3f( 0.1, 0.1, 0.1 );
+				_kdp = Vector3f( 0.19, 0.19, 0.19 );
+				_mass = 0.5;
+				_gravity = 9.81;
 
-		_vehicle_status_sub.update(&_vehicle_status);
+				//Position error 
+				_ep = Vector3f( _local_pos.x, _local_pos.y, _local_pos.z) - Vector3f( setpoint.x, setpoint.y, setpoint.z);
+				_edp = Vector3f( _local_pos.vx, _local_pos.vy, _local_pos.vz) - Vector3f( setpoint.vx, setpoint.vy, setpoint.vz );
 
-		const bool manual_control_updated = _manual_control_sp_sub.update(&_manual_control_sp);
+				printf("[lee controller]: ep %f %f %f\n", (double)_ep(0), (double)_ep(1), (double)_ep(2));				
+				
+				
+				Vector3f kp;
+				kp = Vector3f(1.0f, 1.0f, 1.0f);
 
-		// generate the rate setpoint from sticks?
-		bool manual_rate_sp = false;
-
-		if (_v_control_mode.flag_control_manual_enabled &&
-		    !_v_control_mode.flag_control_altitude_enabled &&
-		    !_v_control_mode.flag_control_velocity_enabled &&
-		    !_v_control_mode.flag_control_position_enabled) {
-
-			// landing gear controlled from stick inputs if we are in Manual/Stabilized mode
-			//  limit landing gear update rate to 50 Hz
-			if (hrt_elapsed_time(&_landing_gear.timestamp) > 20_ms) {
-				_landing_gear.landing_gear = get_landing_gear_state();
-				_landing_gear.timestamp = hrt_absolute_time();
-				_landing_gear_pub.publish(_landing_gear);
-			}
-
-			if (!_v_control_mode.flag_control_attitude_enabled) {
-				manual_rate_sp = true;
-			}
-
-			// Check if we are in rattitude mode and the pilot is within the center threshold on pitch and roll
-			//  if true then use published rate setpoint, otherwise generate from manual_control_setpoint (like acro)
-			if (_v_control_mode.flag_control_rattitude_enabled) {
-				manual_rate_sp =
-					(fabsf(_manual_control_sp.y) > _param_mc_ratt_th.get()) ||
-					(fabsf(_manual_control_sp.x) > _param_mc_ratt_th.get());
+				_ddp =  -( _ep.emult( _kp ) + _edp.emult( _kdp ) ) / _mass - _gravity * Vector3f(0.0, 0.0, 1.0) - Vector3f( setpoint.acceleration[0], setpoint.acceleration[1], setpoint.acceleration[2] );
+					
+				printf("[lee controller]: ddp: %f %f %f\n", (double)_ddp(0), (double)_ddp(1), (double)_ddp(2));
 			}
 
-		} else {
-			_landing_gear_sub.update(&_landing_gear);
-		}
+			
+			if (_vehicle_attitude_sub.update(&_v_att)) {
 
-		if (manual_rate_sp) {
-			if (manual_control_updated) {
+				Dcmf R( Quatf(_v_att.q) );
+				Vector3f b1_des;
+				b1_des(0) = cos( des_yaw ); 
+				b1_des(1) = sin( des_yaw ); 
+				b1_des(2) = 0.0;
 
-				// manual rates control - ACRO mode
-				const Vector3f man_rate_sp{
-					math::superexpo(_manual_control_sp.y, _param_mc_acro_expo.get(), _param_mc_acro_supexpo.get()),
-					math::superexpo(-_manual_control_sp.x, _param_mc_acro_expo.get(), _param_mc_acro_supexpo.get()),
-					math::superexpo(_manual_control_sp.r, _param_mc_acro_expo_y.get(), _param_mc_acro_supexpoy.get())};
+				Vector3f b3_des;
+				b3_des = -_ddp / _ddp.norm();
 
-				_rates_sp = man_rate_sp.emult(_acro_rate_max);
-				_thrust_sp = _manual_control_sp.z;
+				Vector3f b2_des;
+    			b2_des = b3_des.cross(b1_des);
+    			b2_des.normalize();
 
-				// publish rate setpoint
-				vehicle_rates_setpoint_s v_rates_sp{};
-				v_rates_sp.roll = _rates_sp(0);
-				v_rates_sp.pitch = _rates_sp(1);
-				v_rates_sp.yaw = _rates_sp(2);
-				v_rates_sp.thrust_body[0] = 0.0f;
-				v_rates_sp.thrust_body[1] = 0.0f;
-				v_rates_sp.thrust_body[2] = -_thrust_sp;
-				v_rates_sp.timestamp = hrt_absolute_time();
 
-				_v_rates_sp_pub.publish(v_rates_sp);
-			}
+				R_des.col(0) = b2_des.cross(b3_des);
+				R_des.col(1) = b2_des;
+				R_des.col(2) = b3_des;
 
-		} else {
-			// use rates setpoint topic
-			vehicle_rates_setpoint_s v_rates_sp;
 
-			if (_v_rates_sp_sub.update(&v_rates_sp)) {
-				_rates_sp(0) = v_rates_sp.roll;
-				_rates_sp(1) = v_rates_sp.pitch;
-				_rates_sp(2) = v_rates_sp.yaw;
-				_thrust_sp = -v_rates_sp.thrust_body[2];
-			}
-		}
+				// Angle error according to lee et al.
+				Matrix3f angle_error_matrix = 0.5f * (R_des.transpose() * R - R.transpose() * R_des);
+				Vector3f angle_error;
+				angle_error(0) = angle_error_matrix(2, 1);
+				angle_error(1) = angle_error_matrix(0, 2);
+				angle_error(2) = angle_error_matrix(1, 0);
 
-		// run the rate controller
-		if (_v_control_mode.flag_control_rates_enabled && !_actuators_0_circuit_breaker_enabled) {
-			//printf("armed: %d\n", _v_control_mode.flag_armed);
-			// reset integral if disarmed
-			if (!_v_control_mode.flag_armed || _vehicle_status.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
-			}
-
-			// update saturation status from mixer feedback
-			if (_motor_limits_sub.updated()) {
-				multirotor_motor_limits_s motor_limits;
-
-				if (_motor_limits_sub.copy(&motor_limits)) {
-					//MultirotorMixer::saturation_status saturation_status;
-					//saturation_status.value = motor_limits.saturation_status;
-					//_rate_control.setSaturationStatus(saturation_status);
-				}
-			}
-
-			// run rate controller
-			const Vector3f att_control; // = _rate_control.update(rates, _rates_sp, angular_accel, dt, _maybe_landed || _landed);
-
-			// publish rate controller status
-			rate_ctrl_status_s rate_ctrl_status{};
-			//_rate_control.getRateControlStatus(rate_ctrl_status);
-			rate_ctrl_status.timestamp = hrt_absolute_time();
-			_controller_status_pub.publish(rate_ctrl_status);
-
-			// publish actuator controls
-			actuator_controls_s actuators{};
-			actuators.control[actuator_controls_s::INDEX_ROLL] = PX4_ISFINITE(att_control(0)) ? att_control(0) : 0.0f;
-			actuators.control[actuator_controls_s::INDEX_PITCH] = PX4_ISFINITE(att_control(1)) ? att_control(1) : 0.0f;
-			actuators.control[actuator_controls_s::INDEX_YAW] = PX4_ISFINITE(att_control(2)) ? att_control(2) : 0.0f;
-			actuators.control[actuator_controls_s::INDEX_THROTTLE] = PX4_ISFINITE(_thrust_sp) ? _thrust_sp : 0.0f;
-			actuators.control[actuator_controls_s::INDEX_LANDING_GEAR] = (float)_landing_gear.landing_gear;
-			actuators.timestamp_sample = angular_velocity.timestamp_sample;
-
-			// scale effort by battery status if enabled
-			if (_param_mc_bat_scale_en.get()) {
-				if (_battery_status_sub.updated()) {
-					battery_status_s battery_status;
-
-					if (_battery_status_sub.copy(&battery_status)) {
-						_battery_status_scale = battery_status.scale;
+				/*
+				printf("Rdes: \n");
+				for(int i=0; i<3; i++ ) {
+					for( int j=0; j<3; j++ ) {
+						printf("%f ", (double)R_des(i,j));
 					}
+					printf("\n");
 				}
-
-				if (_battery_status_scale > 0.0f) {
-					for (int i = 0; i < 4; i++) {
-						actuators.control[i] *= _battery_status_scale;
+				printf("\n");
+				
+				printf("R: \n");
+				for(int i=0; i<3; i++ ) {
+					for( int j=0; j<3; j++ ) {
+						printf("%f ", (double)R(i,j));
 					}
+					printf("\n");
 				}
+				printf("\n");
+				*/
+				printf("Angle error: %f %f %f\n", (double)angle_error(0), (double)angle_error(1), (double)angle_error(2));
+				
+    			Vector3f angular_rate_des(Vector3f( 0.0, 0.0, 0.0) );
+				//angular_rate_des(2) = 0.1f* des_yaw;
+
+				//printf("Rotation Matrix: \n");
+				//printf("%f, %f, %f\n%f, %f, %f\n%f, %f, %f\n", (double)dcm(0,0), (double)dcm(0,1),(double)dcm(0,2), (double)dcm(1,0), (double)dcm(1,1), (double)dcm(1,2), (double)dcm(2,0), (double)dcm(2,1), (double)dcm(2,2));
+				//printf("Yaw: %f Roll: %f Pitch: %f\n", (double)yaw, (double)roll, (double)pitch);
+				
+				//printf("Quaternion: %f %f %f %f\n", (double)_v_att.q[0], (double)_v_att.q[1], (double)_v_att.q[2], (double)_v_att.q[3] );
+				//Vector3f angular_acceleration;
+				//Matrix3f R = QuatToMat( 1.0f, 0.0f , 0.0f , 0.0f );
+				//Vector3f b1_des;
+
+			//}
+
+			//if (_vehicle_angular_velocity_sub.update(&_angular_velocity)) {
+				_vehicle_angular_velocity_sub.update(&_angular_velocity);
+				Vector3f mes_w = Vector3f( _angular_velocity.xyz[0], _angular_velocity.xyz[1], _angular_velocity.xyz[2]);
+
+
+
+
+
+
+
+		    	Vector3f angular_rate_error = mes_w - R_des.transpose() * R * angular_rate_des;
+				//angular_rate_error(0) = 0.0;
+				//angular_rate_error(1) = 0.0;
+				//angular_rate_error(2) = 0.0;
+
+				//printf("angular_rate_error: %f %f %f\n", (double)angular_rate_error(0), (double)angular_rate_error(1), (double)angular_rate_error(2));
+				printf("angular_rate_des: %f %f %f\n", (double)angular_rate_des(0), (double)angular_rate_des(1), (double)angular_rate_des(2));
+
+				
+				Vector3f angular_acceleration;
+
+
+				angular_acceleration = -1.0f * angle_error.emult( _normalized_attitude_gain) - angular_rate_error.emult( _normalized_angular_rate_gain) 
+				+ mes_w.cross( mes_w );
+				
+				
+				
+				_mass = 0.5;
+				float thrust = _mass * _ddp.dot( R.col(2) );
+				//printf("Thrust: %f\n", (double)thrust);
+			
+				matrix::Vector<float, 4> angular_acceleration_thrust; // angular_acceleration_thrust;
+				angular_acceleration_thrust(0) = angular_acceleration(0);
+				angular_acceleration_thrust(1) = angular_acceleration(1);
+				angular_acceleration_thrust(2) = angular_acceleration(2);
+				angular_acceleration_thrust(3) = thrust;
+
+
+				printf("angular_acceleration_thrust: %f %f %f %f\n", (double)angular_acceleration_thrust(0), (double)angular_acceleration_thrust(1), (double)angular_acceleration_thrust(2), (double)angular_acceleration_thrust(3));
+
+				matrix::Vector<float, 4> rotor_velocities;
+				//for(int i=0; i<4; i++ ) {
+				//	for( int j=0; j<4; j++ ) 
+				//		printf("%f ", (double)_wd2rpm(i,j));
+				//	printf("\n");
+				//}
+				//printf("\n");
+				rotor_velocities = _wd2rpm * angular_acceleration_thrust;
+
+				rotor_velocities(0) = fmax(rotor_velocities(0), 0.0);
+				rotor_velocities(1) = fmax(rotor_velocities(1), 0.0);
+				rotor_velocities(2) = fmax(rotor_velocities(2), 0.0);
+				rotor_velocities(3) = fmax(rotor_velocities(3), 0.0);
+
+				rotor_velocities(0) = sqrt(rotor_velocities(0));
+				rotor_velocities(1) = sqrt(rotor_velocities(1));
+				rotor_velocities(2) = sqrt(rotor_velocities(2));
+				rotor_velocities(3) = sqrt(rotor_velocities(3));
+
+
+				//printf("Rotors vel: %f %f %f %f\n", (double)rotor_velocities(0), (double)rotor_velocities(1), (double)rotor_velocities(2), (double)rotor_velocities(3));
+
+				matrix::Vector<float, 4> c;
+				
+				c(0) = ( rotor_velocities(0)  - 100.0f ) / 1000.0f;
+				c(1) = ( rotor_velocities(1)  - 100.0f ) / 1000.0f;
+				c(2) = ( rotor_velocities(2)  - 100.0f ) / 1000.0f;
+				c(3) = ( rotor_velocities(3)  - 100.0f ) / 1000.0f;
+
+				matrix::Vector<float, 4> pwm;
+				float pwm_center = (PWM_DEFAULT_MAX + PWM_DEFAULT_MIN) / 2;
+
+				pwm(0) = ( c(0)*( PWM_DEFAULT_MAX - PWM_DEFAULT_MIN ) + 2.0f*pwm_center) / 2.0f;
+				pwm(1) = ( c(1)*( PWM_DEFAULT_MAX - PWM_DEFAULT_MIN ) + 2.0f*pwm_center) / 2.0f;
+				pwm(2) = ( c(2)*( PWM_DEFAULT_MAX - PWM_DEFAULT_MIN ) + 2.0f*pwm_center) / 2.0f;
+				pwm(3) = ( c(3)*( PWM_DEFAULT_MAX - PWM_DEFAULT_MIN ) + 2.0f*pwm_center) / 2.0f;
+
+				printf("c: %f %f %f %f\n", (double)c(0), (double)c(1), (double)c(2), (double)c(3) );
+				
+				//printf("PWM: %f %f %f %f\n", (double)pwm(0), (double)pwm(1), (double)pwm(2), (double)pwm(3) );
+
+
+				//Rotors vel to PWM
+				//float vmax = 1100.0;
+				//float vmin = 0.0;
+				//float k = 0.0009f;
+
+				//const float pwm_center = (PWM_DEFAULT_MAX + PWM_DEFAULT_MIN) / 2;
+
+				//float m = ( PWM_DEFAULT_MAX - vmax ) / ( PWM_DEFAULT_MIN - vmin ); 
+				//matrix::Vector<float, 4> pwm;
+				//for(int i=0; i<4; i++) {
+				//	pwm(i) = m*rotor_velocities(i) + PWM_DEFAULT_MIN;
+				//} 
+
+				//printf("PWM: %f %f %f %f\n", (double)pwm(0), (double)pwm(1), (double)pwm(2), (double)pwm(3) );
+
+				
+				//angular_acceleration_thrust.block<3, 1>(0, 0) = angular_acceleration;
+				//angular_acceleration_thrust(3) = thrust;
+				//*rotor_velocities = _wd2rpm * angular_acceleration_thrust;
+				//*rotor_velocities = rotor_velocities->cwiseMax(Eigen::VectorXd::Zero(rotor_velocities->rows()));
+				//*rotor_velocities = rotor_velocities->cwiseSqrt();
+				/*
+				//---PWM output
+				actuator_outputs_s actuator_outputs{};
+				actuator_outputs.noutputs = 4;
+				actuator_outputs.output[0] = pwm(0);
+				actuator_outputs.output[1] = pwm(1);
+				actuator_outputs.output[2] = pwm(2);
+				actuator_outputs.output[3] = pwm(3);
+				actuator_outputs.timestamp = hrt_absolute_time();
+				_outputs_pub.publish(actuator_outputs);
+				//---
+
+
+
+
+
+
+
+
+
+
+
+
+				*/
 			}
-
-			actuators.timestamp = hrt_absolute_time();
-			actuators.control[actuator_controls_s::INDEX_ROLL] 	 	= 1.5;
-			actuators.control[actuator_controls_s::INDEX_PITCH]	 	= 1.5;
-			actuators.control[actuator_controls_s::INDEX_YAW]	 	= 1.5;
-			actuators.control[actuator_controls_s::INDEX_THROTTLE]  = 1.5;
-
-			_actuators_0_pub.publish(actuators);
-
-
-			printf("Want to publish a control data: %f %f %f %f\n", (double)actuators.control[actuator_controls_s::INDEX_ROLL], 
-																	(double)actuators.control[actuator_controls_s::INDEX_YAW], 
-																	(double)actuators.control[actuator_controls_s::INDEX_THROTTLE], 
-																	(double)actuators.control[actuator_controls_s::INDEX_ROLL]);
+			//Low level control (output: PWM)
 
 
 
-		} else if (_v_control_mode.flag_control_termination_enabled) {
-			if (!_vehicle_status.is_vtol) {
-				// publish actuator controls
-				actuator_controls_s actuators{};
-				actuators.timestamp = hrt_absolute_time();
-				_actuators_0_pub.publish(actuators);
-			}
+
 		}
+
+
+
+
+
 	}
+	/*else { 
+		//printf("No F task\n");
+
+
+	}
+	*/
+	//Rate controller
+
+
+	
+
+
+
+
+	//actuator_controls_s actuators{};
+	//actuators.timestamp = hrt_absolute_time();
+	//actuators.control[actuator_controls_s::INDEX_ROLL] 	 	= 1.5;
+	//actuators.control[actuator_controls_s::INDEX_PITCH]	 	= 1.5;
+	//actuators.control[actuator_controls_s::INDEX_YAW]	 	= 1.5;
+	//actuators.control[actuator_controls_s::INDEX_THROTTLE]  = 1.5;
+	//_actuators_0_pub.publish(actuators);
+	//printf("Want to publish a control data: %f %f %f %f\n", (double)actuators.control[actuator_controls_s::INDEX_ROLL], 
+	//														(double)actuators.control[actuator_controls_s::INDEX_YAW], 
+	//														(double)actuators.control[actuator_controls_s::INDEX_THROTTLE], 
+	//														(double)actuators.control[actuator_controls_s::INDEX_ROLL]);
+
 
 	perf_end(_loop_perf);
 }
 
 int LeeController::task_spawn(int argc, char *argv[])
 {
-	bool vtol = false;
-
-	if (argc > 1) {
-		if (strcmp(argv[1], "vtol") == 0) {
-			vtol = true;
-		}
-	}
-
-	LeeController *instance = new LeeController(vtol);
+	LeeController *instance = new LeeController();
 
 	if (instance) {
 		_object.store(instance);

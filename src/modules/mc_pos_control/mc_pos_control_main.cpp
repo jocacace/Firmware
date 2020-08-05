@@ -569,16 +569,14 @@ MulticopterPositionControl::Run()
 		}
 
 		// an update is necessary here because otherwise the takeoff state doesn't get skiped with non-altitude-controlled modes
-		_takeoff.updateTakeoffState(_control_mode.flag_armed, _vehicle_land_detected.landed, false, 10.f,
-					    !_control_mode.flag_control_climb_rate_enabled, time_stamp_now);
+		//_takeoff.updateTakeoffState(_control_mode.flag_armed, _vehicle_land_detected.landed, false, 10.f,
+		//			    !_control_mode.flag_control_climb_rate_enabled, time_stamp_now);
 
 		// switch to the required flighttask
 		start_flight_task();
 
 		// check if any task is active
 		if (_flight_tasks.isAnyTaskActive()) {
-
-
 			// setpoints and constraints for the position controller from flighttask or failsafe
 			vehicle_local_position_setpoint_s setpoint = FlightTask::empty_setpoint;
 			vehicle_constraints_s constraints = FlightTask::empty_constraints;
@@ -606,6 +604,8 @@ MulticopterPositionControl::Run()
 			// check if all local states are valid and map accordingly
 			set_vehicle_states(setpoint.vz);
 
+
+	
 			// fix to prevent the takeoff ramp to ramp to a too high value or get stuck because of NAN
 			// TODO: this should get obsolete once the takeoff limiting moves into the flight tasks
 			if (!PX4_ISFINITE(constraints.speed_up) || (constraints.speed_up > _param_mpc_z_vel_max_up.get())) {
@@ -715,6 +715,7 @@ MulticopterPositionControl::Run()
 			_old_landing_gear_position = gear.landing_gear;
 
 		} else {
+
 			// reset the numerical derivatives to not generate d term spikes when coming from non-position controlled operation
 			_vel_x_deriv.reset();
 			_vel_y_deriv.reset();
